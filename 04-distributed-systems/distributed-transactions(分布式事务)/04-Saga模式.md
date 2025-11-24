@@ -1,16 +1,16 @@
-# Saga Pattern 详解
+# Saga模式详解
 
 ## 目录
 1. [Saga概述](#saga概述)
-2. [Saga原理](#saga原理)
-3. [两种编排模式](#两种编排模式)
-4. [Saga实现策略](#saga实现策略)
-5. [Python实现](#python实现)
-6. [Go语言实现](#go语言实现)
-7. [应用场景分析](#应用场景分析)
+2. [核心概念](#核心概念)
+3. [Saga原理](#saga原理)
+4. [编排模式对比](#编排模式对比)
+5. [实现策略](#实现策略)
+6. [核心实现](#核心实现)
+7. [应用场景](#应用场景)
 8. [最佳实践](#最佳实践)
 9. [故障处理](#故障处理)
-10. [性能优化](#性能优化)
+10. [性能与优化](#性能与优化)
 
 ## Saga概述
 
@@ -18,38 +18,118 @@
 
 Saga模式是一种分布式事务管理策略，通过将分布式事务分解为一系列本地事务，每个事务都有对应的补偿操作来实现最终一致性。与2PC/3PC不同，Saga允许多个参与者并行处理，最终通过补偿操作确保所有参与者达到一致状态。
 
+### 核心性能指标
+
+| 性能指标 | 描述 | 计算方式 | 关键影响因素 |
+|---------|------|---------|------------|
+| 响应时间 | Saga事务完成所需时间 | 所有步骤执行时间总和(顺序执行)或最长步骤时间(并行执行) | 步骤数量、单步执行时间、网络延迟 |
+| 吞吐量 | 单位时间内可处理的Saga事务数 | 总事务数/总处理时间 | 并发度、资源利用率、瓶颈服务性能 |
+| 补偿成功率 | 补偿操作成功执行的比例 | 成功补偿次数/需要补偿的总次数 | 补偿设计质量、系统稳定性、幂等性 |
+| 一致性达成时间 | 从开始到所有服务达到一致状态的时间 | 正向执行时间 + 补偿时间(如有) | 故障发生概率、补偿效率、重试策略 |
+
+## 核心概念
+
+### Saga基本组成
+
+| 组件 | 描述 | 作用 |
+|-----|------|------|
+| **步骤(Step)** | Saga中的单个本地事务操作 | 执行特定业务逻辑，是最小执行单元 |
+| **补偿操作(Compensation)** | 与步骤对应的逆向操作 | 用于回滚已完成的步骤，确保最终一致性 |
+| **编排器(Orchestrator)** | 集中式的Saga协调者 | 协调步骤执行和补偿逻辑，管理整体流程 |
+| **参与者(Participant)** | 参与Saga的各服务 | 执行具体的本地事务，提供正向和补偿操作 |
+| **事件(Event)** | Saga执行过程中产生的通知 | 用于状态传递和系统监控 |
+
+### 状态定义
+
 ```python
-from typing import Dict, List, Optional, Callable, Any
-from dataclasses import dataclass, field
-from enum import Enum
-import time
-import uuid
-import asyncio
-import threading
-import logging
-from abc import ABC, abstractmethod
-import json
-import traceback
-from concurrent.futures import ThreadPoolExecutor, as_completed
-
-class SagaStepStatus(Enum):
+class SagaStepStatus:
     """Saga步骤状态"""
-    PENDING = "pending"
-    EXECUTING = "executing"
-    COMPLETED = "completed"
-    FAILED = "failed"
-    COMPENSATING = "compensating"
-    COMPENSATED = "compensated"
-    TIMEOUT = "timeout"
+    PENDING = "pending"      # 等待执行
+    EXECUTING = "executing"  # 正在执行
+    COMPLETED = "completed"  # 执行完成
+    FAILED = "failed"        # 执行失败
+    COMPENSATING = "compensating"  # 正在补偿
+    COMPENSATED = "compensated"    # 补偿完成
+    TIMEOUT = "timeout"      # 执行超时
 
-class SagaStatus(Enum):
+class SagaStatus:
     """Saga事务状态"""
-    RUNNING = "running"
-    COMPLETED = "completed"
-    FAILED = "failed"
-    COMPENSATING = "compensating"
-    COMPENSATED = "compensated"
-    TIMEOUT = "timeout"
+    RUNNING = "running"      # 正在运行
+    COMPLETED = "completed"  # 执行完成
+    FAILED = "failed"        # 执行失败
+    COMPENSATING = "compensating"  # 正在补偿
+    COMPENSATED = "compensated"    # 补偿完成
+    TIMEOUT = "timeout"      # 执行超时
+
+## Saga原理
+
+### Saga执行流程
+
+Saga模式的核心原理是将分布式事务拆分为一系列本地事务，并通过补偿机制确保最终一致性。以下是Saga的基本执行流程：
+
+1. **初始化阶段**：创建Saga实例，定义所有步骤及其补偿操作
+2. **正向执行阶段**：顺序执行每个本地事务步骤
+3. **成功完成**：所有步骤执行成功，Saga事务完成
+4. **补偿执行阶段**：当某步骤失败时，逆序执行已完成步骤的补偿操作
+5. **补偿完成**：所有补偿操作执行完成，系统回到一致状态
+
+### Saga步骤核心实现
+
+```python
+@dataclass
+class SagaStep:
+    """Saga步骤核心定义"""
+    step_id: str          # 步骤唯一标识
+    name: str             # 步骤名称
+    service_name: str     # 所属服务名
+    forward_action: Callable    # 正向操作函数
+    compensation_action: Callable  # 补偿操作函数
+    status: SagaStepStatus = SagaStepStatus.PENDING  # 当前状态
+    result: Any = None    # 执行结果
+    error: str = None     # 错误信息
+    max_retries: int = 3  # 最大重试次数
+    timeout: float = 30.0 # 超时时间
+    
+    def execute(self) -> bool:
+        """执行正向操作"""
+        self.status = SagaStepStatus.EXECUTING
+        
+        try:
+            # 支持同步和异步函数执行
+            if asyncio.iscoroutinefunction(self.forward_action):
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                self.result = loop.run_until_complete(self.forward_action())
+            else:
+                self.result = self.forward_action()
+            
+            self.status = SagaStepStatus.COMPLETED
+            return True
+            
+        except Exception as e:
+            self.status = SagaStepStatus.FAILED
+            self.error = str(e)
+            return False
+    
+    def compensate(self) -> bool:
+        """执行补偿操作"""
+        self.status = SagaStepStatus.COMPENSATING
+        
+        try:
+            # 执行补偿逻辑
+            if asyncio.iscoroutinefunction(self.compensation_action):
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                loop.run_until_complete(self.compensation_action())
+            else:
+                self.compensation_action()
+            
+            self.status = SagaStepStatus.COMPENSATED
+            return True
+            
+        except Exception as e:
+            self.error = f"Compensation failed: {str(e)}"
+            return False
 
 class SagaEventType(Enum):
     """Saga事件类型"""
@@ -63,68 +143,24 @@ class SagaEventType(Enum):
     SAGA_COMPENSATING = "saga_compensating"
     SAGA_COMPENSATED = "saga_compensated"
 
-@dataclass
-class SagaStep:
-    """Saga步骤定义"""
-    step_id: str
-    name: str
-    service_name: str
-    forward_action: Callable
-    compensation_action: Callable
-    status: SagaStepStatus = SagaStepStatus.PENDING
-    result: Any = None
-    error: str = None
-    start_time: float = field(default_factory=time.time)
-    end_time: float = None
-    retry_count: int = 0
-    max_retries: int = 3
-    timeout: float = 30.0
-    
-    def execute(self) -> bool:
-        """执行正向操作"""
-        self.status = SagaStepStatus.EXECUTING
-        
-        try:
-            if asyncio.iscoroutinefunction(self.forward_action):
-                # 异步函数
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                self.result = loop.run_until_complete(self.forward_action())
-            else:
-                # 同步函数
-                self.result = self.forward_action()
-            
-            self.status = SagaStepStatus.COMPLETED
-            self.end_time = time.time()
-            return True
-            
-        except Exception as e:
-            self.status = SagaStepStatus.FAILED
-            self.error = str(e)
-            self.end_time = time.time()
-            return False
-    
-    def compensate(self) -> bool:
-        """执行补偿操作"""
-        self.status = SagaStepStatus.COMPENSATING
-        
-        try:
-            if asyncio.iscoroutinefunction(self.compensation_action):
-                # 异步函数
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                result = loop.run_until_complete(self.compensation_action())
-            else:
-                # 同步函数
-                result = self.compensation_action()
-            
-            self.status = SagaStepStatus.COMPENSATED
-            return True
-            
-        except Exception as e:
-            self.error = f"Compensation failed: {str(e)}"
-            return False
+## 编排模式对比
 
+### 两种主要编排模式
+
+| 特性 | **编排式(Orchestration)** | **编舞式(Choreography)** |
+|-----|--------------------------|------------------------|
+| **控制方式** | 中央协调器控制流程 | 事件驱动，服务间协作 |
+| **复杂性** | 低（集中式管理） | 高（分散在各服务） |
+| **可维护性** | 高（流程一目了然） | 低（难以追踪整体流程） |
+| **耦合度** | 服务间低耦合，但依赖协调器 | 服务间通过事件松耦合 |
+| **调试难度** | 低（集中日志和状态） | 高（事件流复杂） |
+| **扩展性** | 中（需修改协调器） | 高（添加服务只需监听事件） |
+| **适用场景** | 复杂流程，多服务协作 | 简单流程，服务自治性强 |
+| **单点故障** | 有（协调器可能成为SPOF） | 无（无中央控制点） |
+
+### 编排式实现核心组件
+
+```python
 @dataclass
 class SagaEvent:
     """Saga事件"""
@@ -135,7 +171,7 @@ class SagaEvent:
     data: dict = field(default_factory=dict)
 
 class SagaEventListener(ABC):
-    """Saga事件监听器"""
+    """Saga事件监听器接口"""
     
     @abstractmethod
     def on_event(self, event: SagaEvent):
@@ -143,53 +179,40 @@ class SagaEventListener(ABC):
         pass
 
 class SagaOrchestrator:
-    """Saga编排器"""
+    """Saga编排器核心实现"""
     
     def __init__(self, saga_id: str, event_listener: SagaEventListener = None):
-        self.saga_id = saga_id
-        self.steps: List[SagaStep] = []
-        self.status = SagaStatus.RUNNING
-        self.current_step_index = 0
-        self.event_listener = event_listener
-        self.execution_log: List[dict] = []
-        self.mutex = threading.Lock()
-        
-        # 设置日志
-        logging.basicConfig(level=logging.INFO)
-        self.logger = logging.getLogger(f"SagaOrchestrator-{saga_id}")
+        self.saga_id = saga_id  # 唯一标识
+        self.steps: List[SagaStep] = []  # 步骤列表
+        self.status = SagaStatus.RUNNING  # 初始状态
+        self.event_listener = event_listener  # 事件监听器
+        self.execution_log: List[dict] = []  # 执行日志
+        self.mutex = threading.Lock()  # 线程安全锁
     
     def add_step(self, step: SagaStep):
         """添加Saga步骤"""
         with self.mutex:
             self.steps.append(step)
-        self.logger.info(f"Added step: {step.name}")
     
     def execute(self) -> bool:
-        """执行Saga"""
+        """执行Saga事务"""
         self.status = SagaStatus.RUNNING
         self._emit_event(SagaEventType.SAGA_STARTED, self.saga_id)
-        
-        self.logger.info(f"Starting saga execution: {self.saga_id}")
-        self.logger.info(f"Total steps: {len(self.steps)}")
         
         try:
             # 正向执行所有步骤
             for step in self.steps:
-                self.logger.info(f"Executing step: {step.name}")
-                
                 success = self._execute_step_with_retry(step)
                 if not success:
-                    self.logger.error(f"Step {step.name} failed, starting compensation")
+                    # 失败时触发补偿
                     self._compensate()
                     return False
             
             self.status = SagaStatus.COMPLETED
             self._emit_event(SagaEventType.SAGA_COMPLETED, self.saga_id)
-            self.logger.info("Saga completed successfully")
             return True
             
         except Exception as e:
-            self.logger.error(f"Saga execution failed: {str(e)}")
             self.status = SagaStatus.FAILED
             self._emit_event(SagaEventType.SAGA_FAILED, self.saga_id, {"error": str(e)})
             return False
@@ -473,20 +496,33 @@ class MockOrderService:
             return True
         return False
 
+## 实现策略
+
+### 补偿设计核心原则
+
+#### 补偿操作的关键特性
+
+| 特性 | 描述 | 实现要点 |
+|-----|-----|--------|
+| **幂等性** | 多次执行补偿操作结果相同 | 使用唯一标识防止重复补偿 |
+| **可重试性** | 失败后可重新执行 | 添加重试机制和超时处理 |
+| **异步性** | 允许异步执行补偿 | 使用消息队列确保最终执行 |
+| **隔离性** | 补偿不影响其他操作 | 事务隔离和资源锁定 |
+| **可观察性** | 补偿过程可监控 | 详细日志和状态跟踪 |
+
+### 模拟服务实现
+
+以下是简化的模拟服务类，用于演示Saga模式中的关键操作：
+
 class MockInventoryService:
-    """模拟库存服务"""
+    """库存服务模拟实现"""
     
     def __init__(self):
-        self.inventory = {
-            "item1": {"stock": 100, "reserved": 0},
-            "item2": {"stock": 50, "reserved": 0},
-            "item3": {"stock": 25, "reserved": 0}
-        }
-        self.reservations = {}
+        self.inventory = {"item1": {"stock": 100, "reserved": 0}, "item2": {"stock": 50, "reserved": 0}, "item3": {"stock": 25, "reserved": 0}}
         self.logger = logging.getLogger("InventoryService")
     
     def reserve_inventory(self, items: List[dict]) -> dict:
-        """预留库存"""
+        """预留库存（正向操作）"""
         reservations = {}
         
         for item in items:
@@ -510,24 +546,26 @@ class MockInventoryService:
         return reservations
     
     def release_reservations(self, reservations: dict) -> bool:
-        """释放预留"""
+        """释放预留（补偿操作） - 幂等性实现，确保多次调用结果一致"""
         for item_id, quantity in reservations.items():
+            # 幂等性检查 - 即使库存数据不完整也能正确执行
             if item_id in self.inventory:
-                self.inventory[item_id]["reserved"] -= quantity
+                # 确保不会出现负值预留
+                self.inventory[item_id]["reserved"] = max(0, self.inventory[item_id]["reserved"] - quantity)
                 self.logger.info(f"Released reservation: {quantity} units of {item_id}")
         
         time.sleep(0.2)  # 模拟服务延迟
         return True
 
 class MockPaymentService:
-    """模拟支付服务"""
+    """支付服务模拟实现"""
     
     def __init__(self):
         self.transactions = {}
         self.logger = logging.getLogger("PaymentService")
     
     def process_payment(self, payment_info: dict) -> dict:
-        """处理支付"""
+        """处理支付（正向操作）"""
         payment_id = f"payment_{uuid.uuid4().hex[:8]}"
         amount = payment_info.get("amount", 0)
         card_number = payment_info.get("card_number", "")
@@ -536,8 +574,8 @@ class MockPaymentService:
         self.logger.info(f"Processing payment: ${amount}")
         time.sleep(0.8)  # 模拟支付处理时间
         
-        # 模拟5%的失败率
-        if amount > 1000:  # 大额支付失败模拟
+        # 模拟大额支付失败场景
+        if amount > 1000:
             raise Exception("Payment failed: Insufficient funds")
         
         transaction = {
@@ -554,23 +592,27 @@ class MockPaymentService:
         return transaction
     
     def refund_payment(self, payment_result: dict) -> bool:
-        """退款"""
+        """退款（补偿操作） - 幂等性设计，支持重复调用"""
         payment_id = payment_result.get("payment_id")
-        if payment_id in self.transactions:
-            self.transactions[payment_id]["status"] = "refunded"
-            self.logger.info(f"Payment refunded: {payment_id}")
+        
+        # 幂等性检查 - 如果支付记录不存在或已退款，直接返回成功
+        if payment_id not in self.transactions or self.transactions[payment_id]["status"] == "refunded":
             return True
-        return False
+        
+        # 执行退款操作
+        self.transactions[payment_id]["status"] = "refunded"
+        self.logger.info(f"Payment refunded: {payment_id}")
+        return True
 
 class MockShippingService:
-    """模拟配送服务"""
+    """配送服务模拟实现"""
     
     def __init__(self):
         self.shipments = {}
         self.logger = logging.getLogger("ShippingService")
     
     def schedule_shipping(self, shipping_info: dict) -> dict:
-        """安排配送"""
+        """安排配送（正向操作）"""
         shipment_id = f"shipment_{uuid.uuid4().hex[:8]}"
         address = shipping_info.get("address", "")
         
@@ -591,12 +633,15 @@ class MockShippingService:
         return shipment
     
     def cancel_shipping(self, shipment_id: str) -> bool:
-        """取消配送"""
-        if shipment_id in self.shipments:
-            self.shipments[shipment_id]["status"] = "cancelled"
-            self.logger.info(f"Shipping cancelled: {shipment_id}")
+        """取消配送（补偿操作） - 幂等性实现，允许重复取消"""
+        # 幂等性检查 - 如果配送不存在，直接返回成功
+        if shipment_id not in self.shipments:
             return True
-        return False
+        
+        # 执行取消操作
+        self.shipments[shipment_id]["status"] = "cancelled"
+        self.logger.info(f"Shipping cancelled: {shipment_id}")
+        return True
 
 class BankTransferSagaOrchestrator(SagaOrchestrator):
     """银行转账Saga编排器"""
@@ -807,101 +852,67 @@ class SagaBestPractices:
     
     @staticmethod
     def design_principles():
-        """设计原则"""
-        principles = {
-            "compensation_design": [
-                "Keep compensation operations idempotent",
-                "Design compensation to handle partial failures",
-                "Make compensation operations commutative",
-                "Test compensation paths thoroughly",
-                "Consider eventual consistency timeframes"
-            ],
-            "service_design": [
-                "Design services to be independent and autonomous",
-                "Implement proper error handling and retries",
-                "Use event sourcing for complex state changes",
-                "Design APIs to support sagas",
-                "Implement proper observability"
-            ],
-            "orchestration_design": [
-                "Keep orchestration logic simple",
-                "Implement proper timeout handling",
-                "Design for scalability and resilience",
-                "Use circuit breakers for external calls",
-                "Implement comprehensive monitoring"
-            ],
-            "data_consistency": [
-                "Design database schemas for sagas",
-                "Use separate databases per service",
-                "Implement eventual consistency patterns",
-                "Design for compensating transactions",
-                "Consider using event stores"
-            ]
-        }
-        
+        """设计原则与最佳实践"""
         print("=== Saga Design Principles ===\n")
         
-        for category, guidelines in principles.items():
-            print(f"**{category.replace('_', ' ').title()}**")
-            for guideline in guidelines:
-                print(f"  • {guideline}")
-            print()
+        # 设计原则表格
+        print("| 原则 | 描述 | 实施建议 |")
+        print("|-----|-----|--------|")
+        print("| **幂等性设计** | 所有操作必须支持重复执行 | 1. 使用唯一ID标识每个操作<br>2. 实现状态机避免重复执行<br>3. 补偿操作必须支持幂等 |")
+        print("| **事务边界清晰** | 明确定义每个步骤的责任 | 1. 一个步骤只负责一个业务操作<br>2. 避免在单个步骤中执行多个业务逻辑<br>3. 步骤间数据传递清晰 |")
+        print("| **补偿机制完善** | 每个正向操作都有对应的补偿 | 1. 补偿逻辑必须能恢复初始状态<br>2. 设计足够的超时和重试机制<br>3. 记录详细的执行日志 |")
+        print("| **状态管理** | 集中管理Saga执行状态 | 1. 使用持久化存储保存Saga状态<br>2. 定期检查和恢复中断的Saga<br>3. 提供状态查询接口 |")
+        print("| **超时处理** | 合理设置超时时间 | 1. 为每个步骤设置独立超时<br>2. 超时后立即触发补偿<br>3. 实现渐进式超时策略 |")
+        print("| **监控与告警** | 全面监控执行过程 | 1. 记录所有关键事件<br>2. 实时监控补偿触发率<br>3. 对异常模式设置告警 |")
+        print("\n")
     
     @staticmethod
     def common_patterns():
-        """常见模式"""
-        patterns = {
-            "choreography_vs_orchestration": {
-                "choreography": {
-                    "description": "Services react to events from other services",
-                    "pros": ["No central coordinator", "Scalable", "Loose coupling"],
-                    "cons": ["Complex event flows", "Hard to debug", "Circular dependencies"],
-                    "best_for": "Simple sagas with few services"
-                },
-                "orchestration": {
-                    "description": "Central orchestrator coordinates all steps",
-                    "pros": ["Centralized control", "Easier debugging", "Clear flow"],
-                    "cons": ["Single point of failure", "Coordination overhead", "Tight coupling"],
-                    "best_for": "Complex sagas with many services"
-                }
-            },
-            "compensation_strategies": {
-                "saga_compensation": {
-                    "description": "Each step has a corresponding compensation",
-                    "pros": ["Flexible", "Can handle various failure scenarios"],
-                    "cons": ["Complex to design", "May not always be possible"]
-                },
-                "business_compensation": {
-                    "description": "Business-level compensating transactions",
-                    "pros": ["Simpler logic", "Business-focused"],
-                    "cons": ["Less granular", "May miss edge cases"]
-                }
-            },
-            "timeout_handling": {
-                "per_step_timeout": {
-                    "description": "Each step has its own timeout",
-                    "pros": ["Fine-grained control", "Flexible"],
-                    "cons": ["Complex configuration", "Hard to tune"]
-                },
-                "global_timeout": {
-                    "description": "Saga has a global timeout",
-                    "pros": ["Simple", "Easy to understand"],
-                    "cons": ["Less flexible", "May cause premature failures"]
-                }
-            }
-        }
-        
+        """实现模式与最佳实践"""
         print("=== Common Saga Patterns ===\n")
         
-        for pattern_type, options in patterns.items():
-            print(f"**{pattern_type.replace('_', ' ').title()}**")
-            for option, details in options.items():
-                print(f"  **{option.replace('_', ' ').title()}**: {details['description']}")
-                if 'pros' in details:
-                    print(f"    Pros: {', '.join(details['pros'])}")
-                    print(f"    Cons: {', '.join(details['cons'])}")
-                    print(f"    Best for: {details['best_for']}")
-            print()
+        # 实现模式推荐
+        print("### 1. 编排式模式 (推荐复杂场景)\n")
+        print("**适用场景**：")
+        print("- 流程复杂，涉及多个服务协作")
+        print("- 需要中央控制和监控")
+        print("- 业务流程频繁变化")
+        print("\n**实现要点**：")
+        print("- 引入专门的Saga协调器服务")
+        print("- 协调器负责调用各个服务并管理补偿流程")
+        print("- 使用工作流引擎实现复杂编排")
+        print("\n")
+        
+        print("### 2. 编舞式模式 (推荐简单场景)\n")
+        print("**适用场景**：")
+        print("- 流程简单，服务间耦合度低")
+        print("- 强调服务自治性")
+        print("- 适合微服务架构")
+        print("\n**实现要点**：")
+        print("- 使用消息队列/事件总线")
+        print("- 服务通过监听事件触发动作")
+        print("- 补偿通过发布特定事件实现")
+        print("\n")
+        
+        # 性能优化建议
+        print("### 性能优化建议\n")
+        print("1. **异步执行**：使用异步模式提高吞吐量")
+        print("2. **并行步骤**：不相关的步骤并行执行")
+        print("3. **批量操作**：对大量数据采用批量处理")
+        print("4. **缓存策略**：缓存频繁访问的数据")
+        print("5. **资源池化**：合理使用连接池和线程池")
+        print("\n")
+        
+        # 常见陷阱与避免方法
+        print("### 常见陷阱与避免方法\n")
+        print("| 陷阱 | 问题 | 避免方法 |")
+        print("|-----|-----|--------|")
+        print("| **长事务风险** | Saga执行时间过长导致资源锁定 | 分解为更小的Saga，设置合理超时 |")
+        print("| **补偿失败** | 补偿操作执行失败 | 实现重试机制，设置最大重试次数 |")
+        print("| **数据不一致** | 网络分区导致部分执行 | 使用幂等设计，提供最终一致性保证 |")
+        print("| **性能下降** | 服务间通信开销大 | 使用本地消息表和事件溯源 |")
+        print("| **监控困难** | 难以追踪整体执行情况 | 集中式日志，端到端追踪，可视化监控 |")
+        print("\n")
 
 # 主演示函数
 def demo_saga_pattern():
