@@ -56,271 +56,612 @@ graph TD
 
 **键值数据库的核心概念**：
 
-```java
-// 键值存储接口
-public interface KeyValueStore {
-    void put(String key, byte[] value);
-    byte[] get(String key);
-    void delete(String key);
-    boolean exists(String key);
-    
-    // 批量操作
-    void putAll(Map<String, byte[]> entries);
-    Map<String, byte[]> getAll(List<String> keys);
-    void deleteAll(List<String> keys);
-    
-    // 迭代操作
-    KeyValueIterator scan(String startKey, String endKey);
-    KeyValueIterator scanAll();
-}
+```python
+# 键值存储接口
+from abc import ABC, abstractmethod
+from typing import Dict, List, Optional, Iterator, Any
+import threading
+import time
+import random
+from collections import OrderedDict, defaultdict
+from enum import Enum
 
-// Redis风格的键值存储实现
-public class RedisStyleKeyValueStore implements KeyValueStore {
-    private final Map<String, byte[]> dataStore = new ConcurrentHashMap<>();
-    private final EvictionPolicy evictionPolicy;
-    private final int maxSize;
+class KeyValueEntry:
+    """键值条目"""
+    def __init__(self, key: str, value: bytes):
+        self.key = key
+        self.value = value
+
+class KeyValueIterator(Iterator[KeyValueEntry], ABC):
+    """键值迭代器接口"""
+    pass
+
+class KeyValueStore(ABC):
+    """键值存储接口"""
     
-    public RedisStyleKeyValueStore(EvictionPolicy policy, int maxSize) {
-        this.evictionPolicy = policy;
-        this.maxSize = maxSize;
-    }
+    @abstractmethod
+    def put(self, key: str, value: bytes) -> None:
+        """写入键值对"""
+        pass
     
-    @Override
-    public void put(String key, byte[] value) {
-        // 检查容量限制
-        if (!dataStore.containsKey(key) && dataStore.size() >= maxSize) {
-            evictEntry();
-        }
-        
-        dataStore.put(key, value);
-        
-        // 更新访问统计
-        updateAccessStats(key);
-    }
+    @abstractmethod
+    def get(self, key: str) -> Optional[bytes]:
+        """读取键对应的值"""
+        pass
     
-    @Override
-    public byte[] get(String key) {
-        byte[] value = dataStore.get(key);
-        
-        // 更新访问统计和LRU信息
-        if (value != null) {
-            updateAccessStats(key);
-        }
-        
-        return value;
-    }
+    @abstractmethod
+    def delete(self, key: str) -> None:
+        """删除键值对"""
+        pass
     
-    @Override
-    public void delete(String key) {
-        dataStore.remove(key);
-        removeAccessStats(key);
-    }
+    @abstractmethod
+    def exists(self, key: str) -> bool:
+        """检查键是否存在"""
+        pass
     
-    @Override
-    public KeyValueIterator scan(String startKey, String endKey) {
-        return new KeyValueIterator() {
-            private final List<String> keys = new ArrayList<>();
-            private int currentIndex = 0;
+    @abstractmethod
+    def put_all(self, entries: Dict[str, bytes]) -> None:
+        """批量写入键值对"""
+        pass
+    
+    @abstractmethod
+    def get_all(self, keys: List[str]) -> Dict[str, bytes]:
+        """批量读取键对应的值"""
+        pass
+    
+    @abstractmethod
+    def delete_all(self, keys: List[str]) -> None:
+        """批量删除键值对"""
+        pass
+    
+    @abstractmethod
+    def scan(self, start_key: str, end_key: Optional[str] = None) -> KeyValueIterator:
+        """扫描指定范围的键值对"""
+        pass
+    
+    @abstractmethod
+    def scan_all(self) -> KeyValueIterator:
+        """扫描所有键值对"""
+        pass
+
+# 驱逐策略枚举
+class EvictionPolicy(Enum):
+    LRU = "最近最少使用"
+    LFU = "最不经常使用"
+    FIFO = "先进先出"
+    RANDOM = "随机"
+
+# Redis风格的键值存储实现
+class RedisStyleKeyValueStore(KeyValueStore):
+    """Redis风格的键值存储实现"""
+    
+    def __init__(self, policy: EvictionPolicy, max_size: int):
+        self.data_store: Dict[str, bytes] = {}  # 数据存储
+        self.eviction_policy = policy  # 驱逐策略
+        self.max_size = max_size  # 最大容量
+        self.access_stats: Dict[str, "AccessStats"] = {}  # 访问统计
+        self.lock = threading.RLock()  # 线程安全锁
+        self.insertion_order = OrderedDict()  # 用于FIFO策略
+    
+    def put(self, key: str, value: bytes) -> None:
+        """写入键值对"""
+        with self.lock:
+            # 检查容量限制
+            if key not in self.data_store and len(self.data_store) >= self.max_size:
+                self._evict_entry()
             
-            {
-                // 收集范围内的键
-                dataStore.keySet().stream()
-                    .filter(key -> key.compareTo(startKey) >= 0 && 
-                                  (endKey == null || key.compareTo(endKey) <= 0))
-                    .sorted()
-                    .forEach(keys::add);
-            }
+            # 更新或插入数据
+            self.data_store[key] = value
             
-            @Override
-            public boolean hasNext() {
-                return currentIndex < keys.size();
-            }
+            # 更新访问统计
+            self._update_access_stats(key)
             
-            @Override
-            public KeyValueEntry next() {
-                if (!hasNext()) {
-                    throw new NoSuchElementException();
-                }
+            # 更新插入顺序（用于FIFO）
+            if self.eviction_policy == EvictionPolicy.FIFO:
+                if key in self.insertion_order:
+                    del self.insertion_order[key]
+                self.insertion_order[key] = None
+    
+    def get(self, key: str) -> Optional[bytes]:
+        """读取键对应的值"""
+        with self.lock:
+            value = self.data_store.get(key)
+            
+            # 更新访问统计
+            if value is not None:
+                self._update_access_stats(key)
                 
-                String key = keys.get(currentIndex++);
-                return new KeyValueEntry(key, dataStore.get(key));
-            }
-        };
-    }
+                # 更新插入顺序位置（用于FIFO）
+                if self.eviction_policy == EvictionPolicy.FIFO and key in self.insertion_order:
+                    del self.insertion_order[key]
+                    self.insertion_order[key] = None
+            
+            return value
     
-    private void evictEntry() {
-        switch (evictionPolicy) {
-            case LRU:
-                evictLRU();
-                break;
-            case LFU:
-                evictLFU();
-                break;
-            case FIFO:
-                evictFIFO();
-                break;
-            case RANDOM:
-                evictRandom();
-                break;
-        }
-    }
+    def delete(self, key: str) -> None:
+        """删除键值对"""
+        with self.lock:
+            if key in self.data_store:
+                del self.data_store[key]
+                self._remove_access_stats(key)
+                if self.eviction_policy == EvictionPolicy.FIFO and key in self.insertion_order:
+                    del self.insertion_order[key]
     
-    private void evictLRU() {
-        String lruKey = dataStore.entrySet().stream()
-                .min(Comparator.comparingLong(entry -> getLastAccessTime(entry.getKey())))
-                .map(Map.Entry::getKey)
-                .orElseThrow(() new IllegalStateException("No entry to evict"));
+    def exists(self, key: str) -> bool:
+        """检查键是否存在"""
+        with self.lock:
+            return key in self.data_store
+    
+    def put_all(self, entries: Dict[str, bytes]) -> None:
+        """批量写入键值对"""
+        for key, value in entries.items():
+            self.put(key, value)
+    
+    def get_all(self, keys: List[str]) -> Dict[str, bytes]:
+        """批量读取键对应的值"""
+        result = {}
+        for key in keys:
+            value = self.get(key)
+            if value is not None:
+                result[key] = value
+        return result
+    
+    def delete_all(self, keys: List[str]) -> None:
+        """批量删除键值对"""
+        for key in keys:
+            self.delete(key)
+    
+    def scan(self, start_key: str, end_key: Optional[str] = None) -> KeyValueIterator:
+        """扫描指定范围的键值对"""
+        with self.lock:
+            # 创建键列表的副本
+            keys = sorted(list(self.data_store.keys()))
+            
+            # 筛选范围内的键
+            filtered_keys = []
+            for key in keys:
+                if key >= start_key and (end_key is None or key <= end_key):
+                    filtered_keys.append(key)
+            
+            # 创建迭代器
+            class ScanIterator(KeyValueIterator):
+                def __init__(self, data_store, keys):
+                    self.data_store = data_store
+                    self.keys = keys
+                    self.index = 0
+                
+                def __next__(self):
+                    if self.index >= len(self.keys):
+                        raise StopIteration
+                    key = self.keys[self.index]
+                    self.index += 1
+                    return KeyValueEntry(key, self.data_store[key])
+            
+            return ScanIterator(self.data_store.copy(), filtered_keys)
+    
+    def scan_all(self) -> KeyValueIterator:
+        """扫描所有键值对"""
+        return self.scan("", None)
+    
+    def _evict_entry(self) -> None:
+        """根据策略驱逐条目"""
+        if not self.data_store:
+            return
         
-        dataStore.remove(lruKey);
-    }
+        with self.lock:
+            if self.eviction_policy == EvictionPolicy.LRU:
+                self._evict_lru()
+            elif self.eviction_policy == EvictionPolicy.LFU:
+                self._evict_lfu()
+            elif self.eviction_policy == EvictionPolicy.FIFO:
+                self._evict_fifo()
+            elif self.eviction_policy == EvictionPolicy.RANDOM:
+                self._evict_random()
     
-    private void evictLFU() {
-        String lfuKey = dataStore.entrySet().stream()
-                .min(Comparator.comparingLong(entry -> getAccessCount(entry.getKey())))
-                .map(Map.Entry::getKey)
-                .orElseThrow(() -> new IllegalStateException("No entry to evict"));
+    def _evict_lru(self) -> None:
+        """驱逐最近最少使用的条目"""
+        if not self.data_store:
+            return
         
-        dataStore.remove(lfuKey);
-    }
-    
-    private void evictRandom() {
-        List<String> keys = new ArrayList<>(dataStore.keySet());
-        String randomKey = keys.get(new Random().nextInt(keys.size()));
-        dataStore.remove(randomKey);
-    }
-    
-    // 访问统计管理
-    private final Map<String, AccessStats> accessStats = new ConcurrentHashMap<>();
-    
-    private void updateAccessStats(String key) {
-        AccessStats stats = accessStats.computeIfAbsent(key, k -> new AccessStats());
-        stats.recordAccess();
-    }
-    
-    private long getLastAccessTime(String key) {
-        return accessStats.getOrDefault(key, new AccessStats()).getLastAccessTime();
-    }
-    
-    private long getAccessCount(String key) {
-        return accessStats.getOrDefault(key, new AccessStats()).getAccessCount();
-    }
-    
-    public enum EvictionPolicy {
-        LRU, LFU, FIFO, RANDOM
-    }
-    
-    private static class AccessStats {
-        private long accessCount = 0;
-        private long lastAccessTime = System.currentTimeMillis();
+        # 找到最后访问时间最早的键
+        lru_key = min(
+            self.data_store.keys(),
+            key=lambda k: self._get_last_access_time(k)
+        )
         
-        void recordAccess() {
-            this.accessCount++;
-            this.lastAccessTime = System.currentTimeMillis();
-        }
+        self.data_store.pop(lru_key)
+        self._remove_access_stats(lru_key)
+    
+    def _evict_lfu(self) -> None:
+        """驱逐最不经常使用的条目"""
+        if not self.data_store:
+            return
         
-        long getAccessCount() { return accessCount; }
-        long getLastAccessTime() { return lastAccessTime; }
-    }
-}
+        # 找到访问次数最少的键
+        lfu_key = min(
+            self.data_store.keys(),
+            key=lambda k: self._get_access_count(k)
+        )
+        
+        self.data_store.pop(lfu_key)
+        self._remove_access_stats(lfu_key)
+    
+    def _evict_fifo(self) -> None:
+        """驱逐最先插入的条目"""
+        if not self.data_store or not self.insertion_order:
+            return
+        
+        # 移除第一个插入的键
+        fifo_key, _ = self.insertion_order.popitem(last=False)
+        self.data_store.pop(fifo_key)
+        self._remove_access_stats(fifo_key)
+    
+    def _evict_random(self) -> None:
+        """随机驱逐条目"""
+        if not self.data_store:
+            return
+        
+        # 随机选择一个键
+        random_key = random.choice(list(self.data_store.keys()))
+        self.data_store.pop(random_key)
+        self._remove_access_stats(random_key)
+    
+    def _update_access_stats(self, key: str) -> None:
+        """更新访问统计"""
+        stats = self.access_stats.setdefault(key, self.AccessStats())
+        stats.record_access()
+    
+    def _remove_access_stats(self, key: str) -> None:
+        """移除访问统计"""
+        if key in self.access_stats:
+            del self.access_stats[key]
+    
+    def _get_last_access_time(self, key: str) -> float:
+        """获取最后访问时间"""
+        stats = self.access_stats.get(key)
+        return stats.last_access_time if stats else 0
+    
+    def _get_access_count(self, key: str) -> int:
+        """获取访问次数"""
+        stats = self.access_stats.get(key)
+        return stats.access_count if stats else 0
+    
+    # 访问统计内部类
+    class AccessStats:
+        """访问统计信息"""
+        
+        def __init__(self):
+            self.access_count = 0
+            self.last_access_time = time.time()
+        
+        def record_access(self) -> None:
+            """记录一次访问"""
+            self.access_count += 1
+            self.last_access_time = time.time()
+    
+    # 异常类
+    class NoSuchElementException(Exception):
+        """元素不存在异常"""
+        pass
+    
+    class IllegalStateException(Exception):
+        """非法状态异常"""
+        pass
 ```
 
 ### 数据分片与一致性
 
 **Dynamo风格的键值存储**：
 
-```java
-// Dynamo风格的键值存储
-public class DynamoStyleKeyValueStore implements KeyValueStore {
-    private final List<Node> nodes;
-    private final ConsistentHashing consistentHashing;
-    private final int replicationFactor;
-    private final ReadRepair readRepair;
-    private final ConflictResolver conflictResolver;
+```python
+# Dynamo风格的键值存储
+import asyncio
+import hashlib
+import time
+from typing import List, Dict, Optional, Tuple, Any
+from dataclasses import dataclass
+from enum import Enum
+import threading
+from collections import OrderedDict
+
+# 版本化值
+@dataclass
+class VersionedValue:
+    value: bytes
+    vector_clock: Dict[str, int]
+    timestamp: int
+
+# 写入结果
+@dataclass
+class WriteResult:
+    success: bool
+    message: str
     
-    public DynamoStyleKeyValueStore(List<Node> nodes, int replicationFactor) {
-        this.nodes = nodes;
-        this.replicationFactor = replicationFactor;
-        this.consistentHashing = new ConsistentHashing(nodes);
-        this.readRepair = new ReadRepair();
-        this.conflictResolver = new VectorClockResolver();
-    }
+    @staticmethod
+    def success():
+        return WriteResult(True, "")
     
-    @Override
-    public void put(String key, byte[] value) {
-        List<Node> targetNodes = consistentHashing.getNodes(key, replicationFactor);
+    @staticmethod
+    def failure(message: str):
+        return WriteResult(False, message)
+
+# 节点接口
+class Node:
+    """分布式系统中的节点"""
+    
+    def __init__(self, node_id: str):
+        self.node_id = node_id
+        self.data: Dict[str, VersionedValue] = {}
+        self.lock = threading.RLock()
+    
+    async def put(self, key: str, value: VersionedValue) -> WriteResult:
+        """写入键值对"""
+        try:
+            with self.lock:
+                self.data[key] = value
+            return WriteResult.success()
+        except Exception as e:
+            return WriteResult.failure(str(e))
+    
+    async def get(self, key: str) -> Optional[VersionedValue]:
+        """读取键值对"""
+        try:
+            with self.lock:
+                return self.data.get(key)
+        except Exception:
+            return None
+
+# 一致性哈希实现
+class ConsistentHashing:
+    """一致性哈希实现"""
+    
+    def __init__(self, nodes: List[Node], replicas: int = 100):
+        self.replicas = replicas
+        self.ring: Dict[int, Node] = {}
+        self.nodes = nodes
         
-        // 创建带版本的信息
-        VersionedValue versionedValue = new VersionedValue(
+        # 构建哈希环
+        for node in nodes:
+            self._add_node_to_ring(node)
+    
+    def _add_node_to_ring(self, node: Node) -> None:
+        """将节点添加到哈希环"""
+        for i in range(self.replicas):
+            # 创建虚拟节点
+            hash_value = self._hash(f"{node.node_id}:{i}")
+            self.ring[hash_value] = node
+    
+    def _remove_node_from_ring(self, node: Node) -> None:
+        """从哈希环移除节点"""
+        for i in range(self.replicas):
+            hash_value = self._hash(f"{node.node_id}:{i}")
+            if hash_value in self.ring:
+                del self.ring[hash_value]
+    
+    def _hash(self, key: str) -> int:
+        """哈希函数"""
+        return int(hashlib.md5(key.encode()).hexdigest(), 16)
+    
+    def get_nodes(self, key: str, count: int) -> List[Node]:
+        """获取负责处理指定键的节点列表"""
+        if not self.ring:
+            return []
+        
+        hash_value = self._hash(key)
+        
+        # 找到第一个大于等于该哈希值的节点
+        sorted_keys = sorted(self.ring.keys())
+        index = 0
+        for i, k in enumerate(sorted_keys):
+            if k >= hash_value:
+                index = i
+                break
+        
+        # 收集节点
+        result = []
+        seen = set()
+        
+        while len(result) < count and len(seen) < len(self.nodes):
+            key = sorted_keys[index % len(sorted_keys)]
+            node = self.ring[key]
+            
+            if node.node_id not in seen:
+                seen.add(node.node_id)
+                result.append(node)
+            
+            index += 1
+        
+        return result
+
+# 向量时钟
+class VectorClock:
+    """向量时钟实现"""
+    
+    @staticmethod
+    def generate_clock() -> Dict[str, int]:
+        """生成初始时钟"""
+        return {}
+    
+    @staticmethod
+    def increment(clock: Dict[str, int], node_id: str) -> Dict[str, int]:
+        """增加节点的时钟值"""
+        new_clock = clock.copy()
+        new_clock[node_id] = new_clock.get(node_id, 0) + 1
+        return new_clock
+    
+    @staticmethod
+    def merge(clock1: Dict[str, int], clock2: Dict[str, int]) -> Dict[str, int]:
+        """合并两个时钟"""
+        merged = clock1.copy()
+        for node_id, value in clock2.items():
+            merged[node_id] = max(merged.get(node_id, 0), value)
+        return merged
+
+# 冲突解决器接口
+class ConflictResolver:
+    """冲突解决器接口"""
+    
+    def resolve_conflicts(self, values: List[VersionedValue]) -> VersionedValue:
+        """解决版本冲突"""
+        pass
+
+# 向量时钟冲突解决器
+class VectorClockResolver(ConflictResolver):
+    """基于向量时钟的冲突解决器"""
+    
+    def resolve_conflicts(self, values: List[VersionedValue]) -> VersionedValue:
+        """解决版本冲突"""
+        if not values:
+            raise ValueError("No values to resolve")
+        
+        # 找到最新的向量时钟
+        latest = values[0]
+        for value in values[1:]:
+            if self._is_newer(value.vector_clock, latest.vector_clock):
+                latest = value
+        
+        return latest
+    
+    def _is_newer(self, clock1: Dict[str, int], clock2: Dict[str, int]) -> bool:
+        """判断clock1是否比clock2新"""
+        # 检查clock1是否包含clock2的所有条目
+        for node_id, value in clock2.items():
+            if clock1.get(node_id, 0) < value:
+                return False
+        
+        # 检查clock1是否至少有一个条目比clock2新
+        for node_id, value in clock1.items():
+            if value > clock2.get(node_id, 0):
+                return True
+        
+        return False
+
+# 读修复
+class ReadRepair:
+    """读修复机制"""
+    
+    async def repair_inconsistent_replicas(
+        self, 
+        key: str, 
+        values: List[VersionedValue], 
+        nodes: List[Node]
+    ) -> None:
+        """修复不一致的副本"""
+        if not values or len(values) <= 1:
+            return
+        
+        # 找到正确的值
+        resolver = VectorClockResolver()
+        correct_value = resolver.resolve_conflicts(values)
+        
+        # 修复所有节点
+        for node in nodes:
+            current_value = await node.get(key)
+            if current_value is None or current_value != correct_value:
+                await node.put(key, correct_value)
+
+# Dynamo风格的键值存储实现
+class DynamoStyleKeyValueStore(KeyValueStore):
+    """Dynamo风格的键值存储实现"""
+    
+    def __init__(self, nodes: List[Node], replication_factor: int = 3):
+        self.nodes = nodes
+        self.replication_factor = replication_factor
+        self.consistent_hashing = ConsistentHashing(nodes)
+        self.read_repair = ReadRepair()
+        self.conflict_resolver = VectorClockResolver()
+    
+    async def put(self, key: str, value: bytes) -> None:
+        """写入键值对"""
+        target_nodes = self.consistent_hashing.get_nodes(key, self.replication_factor)
+        
+        # 创建带版本的信息
+        versioned_value = VersionedValue(
             value, 
-            VectorClock.generateClock(), 
-            System.currentTimeMillis()
-        );
+            VectorClock.generate_clock(), 
+            int(time.time() * 1000)
+        )
         
-        // 异步写入所有副本
-        List<CompletableFuture<WriteResult>> futures = targetNodes.stream()
-                .map(node -> CompletableFuture.supplyAsync(() -> {
-                    try {
-                        return node.put(key, versionedValue);
-                    } catch (Exception e) {
-                        return WriteResult.failure(e.getMessage());
-                    }
-                }))
-                .collect(Collectors.toList());
+        # 异步写入所有副本
+        tasks = []
+        for node in target_nodes:
+            task = asyncio.create_task(node.put(key, versioned_value))
+            tasks.append(task)
         
-        // 等待大部分副本确认
-        CompletableFuture<Void> majority = CompletableFuture.allOf(
-            futures.subList(0, (replicationFactor / 2) + 1).toArray(new CompletableFuture[0])
-        );
+        # 等待大部分副本确认
+        majority_count = (self.replication_factor // 2) + 1
+        done, pending = await asyncio.wait(
+            tasks[:majority_count],
+            timeout=5.0
+        )
         
-        try {
-            majority.get(5, TimeUnit.SECONDS);
-        } catch (Exception e) {
-            // 处理写入失败
-            System.err.println("Write failed: " + e.getMessage());
-        }
-    }
+        # 取消未完成的任务
+        for task in pending:
+            task.cancel()
     
-    @Override
-    public byte[] get(String key) {
-        List<Node> targetNodes = consistentHashing.getNodes(key, replicationFactor);
+    async def get(self, key: str) -> Optional[bytes]:
+        """读取键值对"""
+        target_nodes = self.consistent_hashing.get_nodes(key, self.replication_factor)
         
-        // 并发读取所有副本
-        List<CompletableFuture<VersionedValue>> futures = targetNodes.stream()
-                .map(node -> CompletableFuture.supplyAsync(() -> {
-                    try {
-                        return node.get(key);
-                    } catch (Exception e) {
-                        return null;
-                    }
-                }))
-                .collect(Collectors.toList());
+        # 并发读取所有副本
+        tasks = []
+        for node in target_nodes:
+            task = asyncio.create_task(node.get(key))
+            tasks.append(task)
         
-        // 收集结果
-        List<VersionedValue> values = futures.stream()
-                .map(future -> {
-                    try {
-                        return future.get(5, TimeUnit.SECONDS);
-                    } catch (Exception e) {
-                        return null;
-                    }
-                })
-                .filter(Objects::nonNull)
-                .collect(Collectors.toList());
+        # 收集结果
+        results = await asyncio.gather(*tasks, return_exceptions=False)
         
-        if (values.isEmpty()) {
-            return null;
-        }
+        # 过滤出有效结果
+        valid_values = [v for v in results if v is not None]
         
-        // 冲突解决
-        VersionedValue resolved = conflictResolver.resolveConflicts(values);
+        if not valid_values:
+            return None
         
-        // 读修复
-        if (values.size() > 1) {
-            readRepair.repairInconsistentReplicas(key, values, targetNodes);
-        }
+        # 冲突解决
+        resolved = self.conflict_resolver.resolve_conflicts(valid_values)
         
-        return resolved.getValue();
-    }
+        # 读修复
+        if len(valid_values) > 1:
+            await self.read_repair.repair_inconsistent_replicas(key, valid_values, target_nodes)
+        
+        return resolved.value
+    
+    def delete(self, key: str) -> None:
+        """删除键值对（简单实现）"""
+        # 这里可以实现删除逻辑
+        pass
+    
+    def exists(self, key: str) -> bool:
+        """检查键是否存在"""
+        # 这里可以实现存在性检查
+        return False
+    
+    def put_all(self, entries: Dict[str, bytes]) -> None:
+        """批量写入键值对"""
+        # 这里可以实现批量写入
+        pass
+    
+    def get_all(self, keys: List[str]) -> Dict[str, bytes]:
+        """批量读取键值对"""
+        # 这里可以实现批量读取
+        return {}
+    
+    def delete_all(self, keys: List[str]) -> None:
+        """批量删除键值对"""
+        # 这里可以实现批量删除
+        pass
+    
+    def scan(self, start_key: str, end_key: Optional[str] = None) -> KeyValueIterator:
+        """扫描指定范围的键值对"""
+        # 这里可以实现范围扫描
+        pass
+    
+    def scan_all(self) -> KeyValueIterator:
+        """扫描所有键值对"""
+        # 这里可以实现全表扫描
+        pass
+```
     
     // 一致性哈希
     public static class ConsistentHashing {
