@@ -779,225 +779,205 @@ class DynamoStyleKeyValueStore(KeyValueStore):
 
 ```java
 // 文档数据库实现
-public class DocumentDatabase {
-    private final Map<String, Map<String, Document>> collections = new ConcurrentHashMap<>();
-    private final IndexManager indexManager;
-    private final QueryEngine queryEngine;
+import time
+from collections import defaultdict
+
+class DocumentDatabase:
+    def __init__(self):
+        self.collections = defaultdict(dict)  # collection_name -> {doc_id -> document}
+        self.index_manager = IndexManager()
+        self.query_engine = QueryEngine()
     
-    public DocumentDatabase() {
-        this.indexManager = new IndexManager();
-        this.queryEngine = new QueryEngine();
-    }
+    # 文档CRUD操作
+    def insert_document(self, collection: str, id: str, document: 'Document') -> None:
+        coll = self.collections[collection]
+        
+        # 检查ID冲突
+        if id in coll:
+            raise ValueError(f"Document with id {id} already exists")
+        
+        # 添加元数据
+        document.add_metadata("id", id)
+        document.add_metadata("created_at", time.time())
+        document.add_metadata("updated_at", time.time())
+        document.add_metadata("_version", 1)
+        
+        coll[id] = document
+        
+        # 更新索引
+        self.index_manager.update_indexes(collection, document, None)
     
-    // 文档CRUD操作
-    public void insertDocument(String collection, String id, Document document) {
-        Map<String, Document> coll = collections.computeIfAbsent(collection, k -> new ConcurrentHashMap<>());
+    def find_document(self, collection: str, id: str) -> 'Document':
+        coll = self.collections.get(collection)
+        if coll is None:
+            return None
         
-        // 检查ID冲突
-        if (coll.containsKey(id)) {
-            throw new DocumentAlreadyExistsException("Document with id " + id + " already exists");
-        }
+        doc = coll.get(id)
+        if doc is not None:
+            # 增加版本号和更新时间
+            doc.update_metadata("last_accessed", time.time())
+            doc.increment_version()
         
-        // 添加元数据
-        document.addMetadata("id", id);
-        document.addMetadata("created_at", System.currentTimeMillis());
-        document.addMetadata("updated_at", System.currentTimeMillis());
-        document.addMetadata("_version", 1L);
-        
-        coll.put(id, document);
-        
-        // 更新索引
-        indexManager.updateIndexes(collection, document, null);
-    }
+        return doc
     
-    public Document findDocument(String collection, String id) {
-        Map<String, Document> coll = collections.get(collection);
-        if (coll == null) {
-            return null;
-        }
+    def update_document(self, collection: str, id: str, update: 'DocumentUpdate') -> None:
+        coll = self.collections.get(collection)
+        if coll is None or id not in coll:
+            raise ValueError(f"Document with id {id} not found")
         
-        Document doc = coll.get(id);
-        if (doc != null) {
-            // 增加版本号和更新时间
-            doc.updateMetadata("last_accessed", System.currentTimeMillis());
-            doc.incrementVersion();
-        }
+        old_doc = coll[id]
+        new_doc = self._apply_update(old_doc, update)
         
-        return doc;
-    }
+        # 更新元数据
+        new_doc.update_metadata("updated_at", time.time())
+        new_doc.increment_version()
+        
+        coll[id] = new_doc
+        
+        # 更新索引
+        self.index_manager.update_indexes(collection, new_doc, old_doc)
     
-    public void updateDocument(String collection, String id, DocumentUpdate update) {
-        Map<String, Document> coll = collections.get(collection);
-        if (coll == null || !coll.containsKey(id)) {
-            throw new DocumentNotFoundException("Document with id " + id + " not found");
-        }
+    def delete_document(self, collection: str, id: str) -> None:
+        coll = self.collections.get(collection)
+        if coll is None:
+            return
         
-        Document oldDoc = coll.get(id);
-        Document newDoc = applyUpdate(oldDoc, update);
-        
-        // 更新元数据
-        newDoc.updateMetadata("updated_at", System.currentTimeMillis());
-        newDoc.incrementVersion();
-        
-        coll.put(id, newDoc);
-        
-        // 更新索引
-        indexManager.updateIndexes(collection, newDoc, oldDoc);
-    }
+        doc = coll.pop(id, None)
+        if doc is not None:
+            # 从索引中删除
+            self.index_manager.remove_from_indexes(collection, doc)
     
-    public void deleteDocument(String collection, String id) {
-        Map<String, Document> coll = collections.get(collection);
-        if (coll == null) {
-            return;
-        }
+    def _apply_update(self, old_doc: 'Document', update: 'DocumentUpdate') -> 'Document':
+        new_doc = Document(old_doc)
         
-        Document doc = coll.remove(id);
-        if (doc != null) {
-            // 从索引中删除
-            indexManager.removeFromIndexes(collection, doc);
-        }
-    }
-    
-    private Document applyUpdate(Document oldDoc, DocumentUpdate update) {
-        Document newDoc = new Document(oldDoc);
+        for operation in update.get_operations():
+            operation_type = operation.get_type()
+            if operation_type == "SET":
+                new_doc.set(operation.get_path(), operation.get_value())
+            elif operation_type == "UNSET":
+                new_doc.unset(operation.get_path())
+            elif operation_type == "INCREMENT":
+                new_doc.increment(operation.get_path(), operation.get_value())
+            elif operation_type == "PUSH":
+                new_doc.push(operation.get_path(), operation.get_value())
+            elif operation_type == "PULL":
+                new_doc.pull(operation.get_path(), operation.get_value())
+            elif operation_type == "ARRAY_ADD":
+                new_doc.add_to_array(operation.get_path(), operation.get_value())
+            elif operation_type == "ARRAY_REMOVE":
+                new_doc.remove_from_array(operation.get_path(), operation.get_value())
         
-        for (UpdateOperation operation : update.getOperations()) {
-            switch (operation.getType()) {
-                case SET:
-                    newDoc.set(operation.getPath(), operation.getValue());
-                    break;
-                case UNSET:
-                    newDoc.unset(operation.getPath());
-                    break;
-                case INCREMENT:
-                    newDoc.increment(operation.getPath(), (Number) operation.getValue());
-                    break;
-                case PUSH:
-                    newDoc.push(operation.getPath(), operation.getValue());
-                    break;
-                case PULL:
-                    newDoc.pull(operation.getPath(), operation.getValue());
-                    break;
-                case ARRAY_ADD:
-                    newDoc.addToArray(operation.getPath(), operation.getValue());
-                    break;
-                case ARRAY_REMOVE:
-                    newDoc.removeFromArray(operation.getPath(), operation.getValue());
-                    break;
-            }
-        }
-        
-        return newDoc;
-    }
+        return new_doc
     
-    // 查询方法
-    public QueryResult query(String collection, Query query) {
-        return queryEngine.executeQuery(collection, query, collections);
-    }
+    # 查询方法
+    def query(self, collection: str, query: 'Query') -> 'QueryResult':
+        return self.query_engine.execute_query(collection, query, self.collections)
     
-    public List<Document> findByField(String collection, String field, Object value) {
-        return indexManager.findByIndexedField(collection, field, value);
-    }
+    def find_by_field(self, collection: str, field: str, value: object) -> list['Document']:
+        return self.index_manager.find_by_indexed_field(collection, field, value)
     
-    // 聚合管道
-    public AggregationResult aggregate(String collection, AggregationPipeline pipeline) {
-        return queryEngine.executeAggregation(collection, pipeline, collections);
-    }
-}
+    # 聚合管道
+    def aggregate(self, collection: str, pipeline: 'AggregationPipeline') -> 'AggregationResult':
+        return self.query_engine.execute_aggregation(collection, pipeline, self.collections)
 
 // 文档类
-public class Document {
-    private final Map<String, Object> data = new HashMap<>();
-    private final Map<String, Object> metadata = new HashMap<>();
+class Document:
+    def __init__(self, initial_data: dict = None, old_doc: 'Document' = None):
+        if old_doc is not None:
+            # 复制现有文档
+            self.data = old_doc.data.copy()
+            self.metadata = old_doc.metadata.copy()
+        else:
+            self.data = initial_data.copy() if initial_data is not None else {}
+            self.metadata = {}
     
-    public void set(String path, Object value) {
-        set(data, path, value);
-    }
+    def set(self, path: str, value: object) -> None:
+        self._set(self.data, path, value)
     
-    public Object get(String path) {
-        return get(data, path);
-    }
+    def get(self, path: str) -> object:
+        return self._get(self.data, path)
     
-    public void unset(String path) {
-        unset(data, path);
-    }
+    def unset(self, path: str) -> None:
+        self._unset(self.data, path)
     
-    public void increment(String path, Number amount) {
-        Object current = get(path);
-        Number newValue = amount.doubleValue();
+    def increment(self, path: str, amount: float) -> None:
+        current = self.get(path)
+        new_value = amount
         
-        if (current instanceof Number) {
-            newValue = ((Number) current).doubleValue() + amount.doubleValue();
-        }
+        if isinstance(current, (int, float)):
+            new_value = current + amount
         
-        set(path, newValue);
-    }
+        self.set(path, new_value)
     
-    public void push(String path, Object value) {
-        Object current = get(path);
-        if (current instanceof List) {
-            ((List<?>) current).add(value);
-        } else {
-            List<Object> array = new ArrayList<>();
-            array.add(value);
-            set(path, array);
-        }
-    }
+    def push(self, path: str, value: object) -> None:
+        current = self.get(path)
+        if isinstance(current, list):
+            current.append(value)
+        else:
+            self.set(path, [value])
     
-    public void pull(String path, Object value) {
-        Object current = get(path);
-        if (current instanceof List) {
-            ((List<?>) current).remove(value);
-        }
-    }
+    def pull(self, path: str, value: object) -> None:
+        current = self.get(path)
+        if isinstance(current, list):
+            if value in current:
+                current.remove(value)
     
-    // 内部工具方法
-    private void set(Map<String, Object> target, String path, Object value) {
-        String[] keys = path.split("\\.");
-        Map<String, Object> current = target;
-        
-        for (int i = 0; i < keys.length - 1; i++) {
-            String key = keys[i];
-            current.putIfAbsent(key, new HashMap<String, Object>());
-            Object next = current.get(key);
-            if (next instanceof Map) {
-                current = (Map<String, Object>) next;
-            } else {
-                throw new IllegalArgumentException("Path element " + key + " is not an object");
-            }
-        }
-        
-        current.put(keys[keys.length - 1], value);
-    }
+    # 元数据管理
+    def add_metadata(self, key: str, value: object) -> None:
+        self.metadata[key] = value
     
-    private Object get(Map<String, Object> source, String path) {
-        String[] keys = path.split("\\.");
-        Object current = source;
-        
-        for (String key : keys) {
-            if (current instanceof Map) {
-                current = ((Map<String, Object>) current).get(key);
-            } else {
-                return null;
-            }
-        }
-        
-        return current;
-    }
+    def update_metadata(self, key: str, value: object) -> None:
+        self.metadata[key] = value
     
-    private void unset(Map<String, Object> target, String path) {
-        String[] keys = path.split("\\.");
-        Map<String, Object> current = target;
-        
-        for (int i = 0; i < keys.length - 1; i++) {
-            String key = keys[i];
-            current = (Map<String, Object>) current.computeIfAbsent(key, k -> new HashMap<>());
-        }
-        
-        current.remove(keys[keys.length - 1]);
-    }
+    def get_metadata(self, key: str) -> object:
+        return self.metadata.get(key)
     
-    // 元数据管理
+    def increment_version(self) -> None:
+        current_version = self.metadata.get("_version", 0)
+        self.metadata["_version"] = current_version + 1
+    
+    # 内部工具方法
+    def _set(self, target: dict, path: str, value: object) -> None:
+        keys = path.split(".")
+        current = target
+        
+        for i in range(len(keys) - 1):
+            key = keys[i]
+            if key not in current:
+                current[key] = {}
+            next_val = current[key]
+            if not isinstance(next_val, dict):
+                raise ValueError(f"Path element {key} is not an object")
+            current = next_val
+        
+        current[keys[-1]] = value
+    
+    def _get(self, source: dict, path: str) -> object:
+        keys = path.split(".")
+        current = source
+        
+        for key in keys:
+            if isinstance(current, dict):
+                current = current.get(key)
+            else:
+                return None
+        
+        return current
+    
+    def _unset(self, target: dict, path: str) -> None:
+        keys = path.split(".")
+        current = target
+        
+        for i in range(len(keys) - 1):
+            key = keys[i]
+            if key not in current or not isinstance(current[key], dict):
+                return  # 路径不存在或不是对象，无需删除
+            current = current[key]
+        
+        if keys[-1] in current:
+            del current[keys[-1]]
+    
+    # 元数据管理
     public void addMetadata(String key, Object value) {
         metadata.put(key, value);
     }
@@ -1017,19 +997,16 @@ public class Document {
         this.metadata.putAll(other.metadata);
     }
     
-    private Map<String, Object> deepCopy(Map<String, Object> source) {
-        Map<String, Object> copy = new HashMap<>();
-        source.forEach((key, value) -> {
-            if (value instanceof Map) {
-                copy.put(key, deepCopy((Map<String, Object>) value));
-            } else if (value instanceof List) {
-                copy.put(key, new ArrayList<>((List<?>) value));
-            } else {
-                copy.put(key, value);
-            }
-        });
-        return copy;
-    }
+    def deep_copy(self, source: Dict[str, Any]) -> Dict[str, Any]:
+        copy = {}
+        for key, value in source.items():
+            if isinstance(value, dict):
+                copy[key] = self.deep_copy(value)
+            elif isinstance(value, list):
+                copy[key] = list(value)
+            else:
+                copy[key] = value
+        return copy
 }
 ```
 
@@ -1037,303 +1014,321 @@ public class Document {
 
 **文档数据库索引系统**：
 
-```java
-// 索引管理器
-public class IndexManager {
-    private final Map<String, Map<String, Index>> collectionIndexes = new ConcurrentHashMap<>();
-    
-    // 创建索引
-    public void createIndex(String collection, String field, IndexType type) {
-        Map<String, Index> indexes = collectionIndexes.computeIfAbsent(collection, k -> new ConcurrentHashMap<>());
-        Index index = createIndexInstance(field, type);
-        indexes.put(field, index);
-    }
-    
-    // 复合索引
-    public void createCompoundIndex(String collection, List<String> fields, IndexType type) {
-        String indexKey = String.join(",", fields);
-        Map<String, Index> indexes = collectionIndexes.computeIfAbsent(collection, k -> new ConcurrentHashMap<>());
-        Index index = new CompoundIndex(fields, type);
-        indexes.put(indexKey, index);
-    }
-    
-    // 全文索引
-    public void createTextIndex(String collection, List<String> fields) {
-        String indexKey = "text_" + String.join("_", fields);
-        Map<String, Index> indexes = collectionIndexes.computeIfAbsent(collection, k -> new ConcurrentHashMap<>());
-        TextIndex index = new TextIndex(fields);
-        indexes.put(indexKey, index);
-    }
-    
-    // 更新索引
-    public void updateIndexes(String collection, Document newDoc, Document oldDoc) {
-        Map<String, Index> indexes = collectionIndexes.get(collection);
-        if (indexes == null) {
-            return;
-        }
-        
-        indexes.values().forEach(index -> {
-            if (oldDoc != null) {
-                index.remove(oldDoc);
-            }
-            index.add(newDoc);
-        });
-    }
-    
-    public void removeFromIndexes(String collection, Document doc) {
-        Map<String, Index> indexes = collectionIndexes.get(collection);
-        if (indexes == null) {
-            return;
-        }
-        
-        indexes.values().forEach(index -> index.remove(doc));
-    }
-    
-    // 索引查询
-    public List<Document> findByIndexedField(String collection, String field, Object value) {
-        Map<String, Index> indexes = collectionIndexes.get(collection);
-        if (indexes == null) {
-            return Collections.emptyList();
-        }
-        
-        Index index = indexes.get(field);
-        if (index == null) {
-            return Collections.emptyList();
-        }
-        
-        return index.find(value);
-    }
-    
-    // 选择最佳索引
-    public Index selectBestIndex(String collection, Query query) {
-        Map<String, Index> indexes = collectionIndexes.get(collection);
-        if (indexes == null) {
-            return null;
-        }
-        
-        // 根据查询条件选择最佳索引
-        return indexes.values().stream()
-                .filter(index -> index.canHandleQuery(query))
-                .max(Comparator.comparing(Index::getSelectivity))
-                .orElse(null);
-    }
-    
-    private Index createIndexInstance(String field, IndexType type) {
-        switch (type) {
-            case B_TREE:
-                return new BTreeIndex(field);
-            case HASH:
-                return new HashIndex(field);
-            case SPATIAL:
-                return new SpatialIndex(field);
-            default:
-                return new BTreeIndex(field);
-        }
-    }
-}
+```python
+from enum import Enum
+from typing import List, Dict, Any, Optional, Set
+from collections import defaultdict
 
-// B-Tree索引实现
-public class BTreeIndex implements Index {
-    private final String field;
-    private final BTree<Comparable<?>, Set<String>> bTree;
-    
-    public BTreeIndex(String field) {
-        this.field = field;
-        this.bTree = new BTree<>();
-    }
-    
-    @Override
-    public void add(Document doc) {
-        Object value = doc.get(field);
-        if (value == null) {
-            return;
-        }
-        
-        Comparable<?> key = normalizeKey(value);
-        bTree.put(key, doc.getMetadata("id").toString());
-    }
-    
-    @Override
-    public void remove(Document doc) {
-        Object value = doc.get(field);
-        if (value == null) {
-            return;
-        }
-        
-        Comparable<?> key = normalizeKey(value);
-        bTree.remove(key, doc.getMetadata("id").toString());
-    }
-    
-    @Override
-    public List<Document> find(Object value) {
-        Comparable<?> key = normalizeKey(value);
-        Set<String> docIds = bTree.get(key);
-        
-        if (docIds == null) {
-            return Collections.emptyList();
-        }
-        
-        return docIds.stream()
-                .map(this::loadDocument)
-                .filter(Objects::nonNull)
-                .collect(Collectors.toList());
-    }
-    
-    @Override
-    public List<Document> findRange(Object minValue, Object maxValue) {
-        Comparable<?> minKey = normalizeKey(minValue);
-        Comparable<?> maxKey = normalizeKey(maxValue);
-        
-        Set<String> docIds = bTree.rangeQuery(minKey, maxKey);
-        
-        return docIds.stream()
-                .map(this::loadDocument)
-                .filter(Objects::nonNull)
-                .collect(Collectors.toList());
-    }
-    
-    @Override
-    public boolean canHandleQuery(Query query) {
-        // 检查查询是否可以使用此索引
-        return query.hasFieldCondition(field);
-    }
-    
-    @Override
-    public double getSelectivity() {
-        // 计算索引选择性
-        return bTree.getSize() / (double) getTotalDocuments();
-    }
-    
-    private Comparable<?> normalizeKey(Object value) {
-        if (value instanceof Comparable) {
-            return (Comparable<?>) value;
-        }
-        return value.toString();
-    }
-    
-    private Document loadDocument(String docId) {
-        // 从存储中加载文档
-        // 这里需要访问实际的文档存储
-        return null; // 简化实现
-    }
-}
+# 索引类型枚举
+class IndexType(Enum):
+    B_TREE = "B_TREE"
+    HASH = "HASH"
+    SPATIAL = "SPATIAL"
 
-// 全文索引实现
-public class TextIndex implements Index {
-    private final List<String> fields;
-    private final Map<String, InvertedIndex> invertedIndexes = new HashMap<>();
+# 索引接口定义
+class Index:
+    def add(self, doc: 'Document') -> None:
+        pass
     
-    public TextIndex(List<String> fields) {
-        this.fields = fields;
-        for (String field : fields) {
-            invertedIndexes.put(field, new InvertedIndex());
-        }
-    }
+    def remove(self, doc: 'Document') -> None:
+        pass
     
-    @Override
-    public void add(Document doc) {
-        for (String field : fields) {
-            String text = extractText(doc.get(field));
-            List<String> tokens = tokenize(text);
-            invertedIndexes.get(field).addTokens(tokens, doc.getMetadata("id").toString());
-        }
-    }
+    def find(self, value: Any) -> List['Document']:
+        pass
     
-    @Override
-    public void remove(Document doc) {
-        for (String field : fields) {
-            String text = extractText(doc.get(field));
-            List<String> tokens = tokenize(text);
-            invertedIndexes.get(field).removeTokens(tokens, doc.getMetadata("id").toString());
-        }
-    }
+    def find_range(self, min_value: Any, max_value: Any) -> List['Document']:
+        pass
     
-    @Override
-    public List<Document> find(Object query) {
-        String searchText = query.toString().toLowerCase();
-        List<String> searchTokens = tokenize(searchText);
+    def can_handle_query(self, query: 'Query') -> bool:
+        pass
+    
+    def get_selectivity(self) -> float:
+        pass
+
+# 索引管理器
+class IndexManager:
+    def __init__(self):
+        self.collection_indexes: Dict[str, Dict[str, Index]] = defaultdict(dict)
+    
+    # 创建索引
+    def create_index(self, collection: str, field: str, type: IndexType) -> None:
+        indexes = self.collection_indexes[collection]
+        index = self._create_index_instance(field, type)
+        indexes[field] = index
+    
+    # 复合索引
+    def create_compound_index(self, collection: str, fields: List[str], type: IndexType) -> None:
+        index_key = ",".join(fields)
+        indexes = self.collection_indexes[collection]
+        index = CompoundIndex(fields, type)
+        indexes[index_key] = index
+    
+    # 全文索引
+    def create_text_index(self, collection: str, fields: List[str]) -> None:
+        index_key = "text_" + "_".join(fields)
+        indexes = self.collection_indexes[collection]
+        index = TextIndex(fields)
+        indexes[index_key] = index
+    
+    # 更新索引
+    def update_indexes(self, collection: str, new_doc: 'Document', old_doc: Optional['Document']) -> None:
+        indexes = self.collection_indexes.get(collection)
+        if indexes is None:
+            return
         
-        Set<String> candidateDocIds = new HashSet<>();
-        boolean first = true;
+        for index in indexes.values():
+            if old_doc is not None:
+                index.remove(old_doc)
+            index.add(new_doc)
+    
+    def remove_from_indexes(self, collection: str, doc: 'Document') -> None:
+        indexes = self.collection_indexes.get(collection)
+        if indexes is None:
+            return
         
-        for (String field : fields) {
-            Set<String> fieldDocIds = invertedIndexes.get(field).findDocuments(searchTokens);
+        for index in indexes.values():
+            index.remove(doc)
+    
+    # 索引查询
+    def find_by_indexed_field(self, collection: str, field: str, value: Any) -> List['Document']:
+        indexes = self.collection_indexes.get(collection)
+        if indexes is None:
+            return []
+        
+        index = indexes.get(field)
+        if index is None:
+            return []
+        
+        return index.find(value)
+    
+    # 选择最佳索引
+    def select_best_index(self, collection: str, query: 'Query') -> Optional[Index]:
+        indexes = self.collection_indexes.get(collection)
+        if indexes is None:
+            return None
+        
+        # 根据查询条件选择最佳索引
+        eligible_indexes = [index for index in indexes.values() 
+                           if index.can_handle_query(query)]
+        if not eligible_indexes:
+            return None
             
-            if (first) {
-                candidateDocIds.addAll(fieldDocIds);
-                first = false;
-            } else {
-                candidateDocIds.retainAll(fieldDocIds);
-            }
-        }
-        
-        return candidateDocIds.stream()
-                .map(this::loadDocument)
-                .filter(Objects::nonNull)
-                .collect(Collectors.toList());
-    }
+        return max(eligible_indexes, key=lambda index: index.get_selectivity())
     
-    @Override
-    public boolean canHandleQuery(Query query) {
-        return query.isTextSearch() && fields.stream().anyMatch(query::searchesField);
-    }
-    
-    @Override
-    public double getSelectivity() {
-        // 全文索引的选择性计算
-        return 0.1; // 简化实现
-    }
-    
-    private String extractText(Object value) {
-        if (value == null) {
-            return "";
-        }
-        return value.toString();
-    }
-    
-    private List<String> tokenize(String text) {
-        // 简单的分词实现
-        return Arrays.asList(text.toLowerCase().split("\\W+"));
-    }
-    
-    private Document loadDocument(String docId) {
-        // 从存储中加载文档
-        return null; // 简化实现
+    def _create_index_instance(self, field: str, type: IndexType) -> Index:
+        if type == IndexType.B_TREE:
+            return BTreeIndex(field)
+        elif type == IndexType.HASH:
+            return HashIndex(field)
+        elif type == IndexType.SPATIAL:
+            return SpatialIndex(field)
+        else:
+            return BTreeIndex(field)
     }
 }
 
-// 反向索引
-public class InvertedIndex {
-    private final Map<String, Set<String>> tokenToDocIds = new ConcurrentHashMap<>();
+# B-Tree索引实现（简化版本）
+class BTreeIndex(Index):
+    def __init__(self, field: str):
+        self.field = field
+        # 使用字典模拟B-Tree功能
+        self.tree: Dict[Comparable, Set[str]] = defaultdict(set)
     
-    public void addTokens(List<String> tokens, String docId) {
-        for (String token : tokens) {
-            tokenToDocIds.computeIfAbsent(token, k -> ConcurrentHashMap.newKeySet()).add(docId);
-        }
-    }
+    def add(self, doc: 'Document') -> None:
+        value = doc.get(self.field)
+        if value is None:
+            return
+        
+        key = self._normalize_key(value)
+        doc_id = doc.get_metadata("id")
+        self.tree[key].add(doc_id)
     
-    public void removeTokens(List<String> tokens, String docId) {
-        for (String token : tokens) {
-            Set<String> docIds = tokenToDocIds.get(token);
-            if (docIds != null) {
-                docIds.remove(docId);
-                if (docIds.isEmpty()) {
-                    tokenToDocIds.remove(token);
-                }
-            }
-        }
-    }
+    def remove(self, doc: 'Document') -> None:
+        value = doc.get(self.field)
+        if value is None:
+            return
+        
+        key = self._normalize_key(value)
+        doc_id = doc.get_metadata("id")
+        if key in self.tree:
+            self.tree[key].discard(doc_id)
+            if not self.tree[key]:
+                del self.tree[key]
     
-    public Set<String> findDocuments(List<String> tokens) {
-        return tokens.stream()
-                .map(tokenToDocIds::get)
-                .filter(Objects::nonNull)
-                .reduce(new HashSet<>(), (set1, set2) -> {
-                    set1.addAll(set2);
-                    return set1;
-                });
-    }
+    def find(self, value: Any) -> List['Document']:
+        key = self._normalize_key(value)
+        doc_ids = self.tree.get(key, set())
+        
+        if not doc_ids:
+            return []
+        
+        return [self._load_document(doc_id) for doc_id in doc_ids 
+                if self._load_document(doc_id) is not None]
+    
+    def find_range(self, min_value: Any, max_value: Any) -> List['Document']:
+        min_key = self._normalize_key(min_value)
+        max_key = self._normalize_key(max_value)
+        
+        # 简化的范围查询实现
+        doc_ids = set()
+        for key in self.tree:
+            if min_key <= key <= max_key:
+                doc_ids.update(self.tree[key])
+        
+        return [self._load_document(doc_id) for doc_id in doc_ids 
+                if self._load_document(doc_id) is not None]
+    
+    def can_handle_query(self, query: 'Query') -> bool:
+        # 检查查询是否可以使用此索引
+        return hasattr(query, 'has_field_condition') and query.has_field_condition(self.field)
+    
+    def get_selectivity(self) -> float:
+        # 计算索引选择性
+        return len(self.tree) / (self._get_total_documents() or 1.0)
+    
+    def _normalize_key(self, value: Any) -> Comparable:
+        if isinstance(value, Comparable):
+            return value
+        return str(value)
+    
+    def _load_document(self, doc_id: str) -> Optional['Document']:
+        # 从存储中加载文档
+        # 这里需要访问实际的文档存储
+        return None  # 简化实现
+    
+    def _get_total_documents(self) -> int:
+        # 获取总文档数
+        return 1000  # 简化实现
 }
+
+# 反向索引实现
+class InvertedIndex:
+    def __init__(self):
+        self.token_to_doc_ids: Dict[str, Set[str]] = defaultdict(set)
+    
+    def add_tokens(self, tokens: List[str], doc_id: str) -> None:
+        for token in tokens:
+            self.token_to_doc_ids[token].add(doc_id)
+    
+    def remove_tokens(self, tokens: List[str], doc_id: str) -> None:
+        for token in tokens:
+            if token in self.token_to_doc_ids:
+                self.token_to_doc_ids[token].discard(doc_id)
+                if not self.token_to_doc_ids[token]:
+                    del self.token_to_doc_ids[token]
+    
+    def find_documents(self, search_tokens: List[str]) -> Set[str]:
+        if not search_tokens:
+            return set()
+        
+        # 查找包含所有搜索词的文档
+        candidate_doc_ids = self.token_to_doc_ids.get(search_tokens[0], set())
+        for token in search_tokens[1:]:
+            token_doc_ids = self.token_to_doc_ids.get(token, set())
+            candidate_doc_ids.intersection_update(token_doc_ids)
+        
+        return candidate_doc_ids
+
+# 全文索引实现
+class TextIndex(Index):
+    def __init__(self, fields: List[str]):
+        self.fields = fields
+        self.inverted_indexes: Dict[str, InvertedIndex] = {}
+        for field in fields:
+            self.inverted_indexes[field] = InvertedIndex()
+    
+    def add(self, doc: 'Document') -> None:
+        for field in self.fields:
+            text = self._extract_text(doc.get(field))
+            tokens = self._tokenize(text)
+            doc_id = doc.get_metadata("id")
+            self.inverted_indexes[field].add_tokens(tokens, doc_id)
+    
+    def remove(self, doc: 'Document') -> None:
+        for field in self.fields:
+            text = self._extract_text(doc.get(field))
+            tokens = self._tokenize(text)
+            doc_id = doc.get_metadata("id")
+            self.inverted_indexes[field].remove_tokens(tokens, doc_id)
+    
+    def find(self, value: Any) -> List['Document']:
+        search_text = str(value).lower()
+        search_tokens = self._tokenize(search_text)
+        
+        candidate_doc_ids = set()
+        first = True
+        
+        for field in self.fields:
+            field_doc_ids = self.inverted_indexes[field].find_documents(search_tokens)
+            
+            if first:
+                candidate_doc_ids = field_doc_ids
+                first = False
+            else:
+                candidate_doc_ids.intersection_update(field_doc_ids)
+        
+        return [self._load_document(doc_id) for doc_id in candidate_doc_ids 
+                if self._load_document(doc_id) is not None]
+    
+    def find_range(self, min_value: Any, max_value: Any) -> List['Document']:
+        # 全文索引不支持范围查询
+        return []
+    
+    def can_handle_query(self, query: 'Query') -> bool:
+        # 检查查询是否为文本搜索并包含相关字段
+        return (hasattr(query, 'is_text_search') and query.is_text_search() and
+                hasattr(query, 'searches_field') and 
+                any(query.searches_field(field) for field in self.fields))
+    
+    def get_selectivity(self) -> float:
+        # 全文索引的选择性计算
+        return 0.1  # 简化实现
+    
+    def _extract_text(self, value: Any) -> str:
+        if value is None:
+            return ""
+        return str(value)
+    
+    def _tokenize(self, text: str) -> List[str]:
+        # 简单的分词实现
+        import re
+        return re.findall(r'\w+', text.lower())
+    
+    def _load_document(self, doc_id: str) -> Optional['Document']:
+        # 从存储中加载文档
+        # 这里需要访问实际的文档存储
+        return None  # 简化实现
+
+
+# 反向索引实现
+class InvertedIndex:
+    def __init__(self):
+        self.token_to_doc_ids: Dict[str, Set[str]] = {}
+    
+    def add_tokens(self, tokens: List[str], doc_id: str) -> None:
+        for token in tokens:
+            if token not in self.token_to_doc_ids:
+                self.token_to_doc_ids[token] = set()
+            self.token_to_doc_ids[token].add(doc_id)
+    
+    def remove_tokens(self, tokens: List[str], doc_id: str) -> None:
+        for token in tokens:
+            if token in self.token_to_doc_ids:
+                self.token_to_doc_ids[token].discard(doc_id)
+                if not self.token_to_doc_ids[token]:
+                    del self.token_to_doc_ids[token]
+    
+    def find_documents(self, search_tokens: List[str]) -> Set[str]:
+        if not search_tokens:
+            return set()
+        
+        # 查找包含所有搜索词的文档
+        candidate_doc_ids = self.token_to_doc_ids.get(search_tokens[0], set())
+        for token in search_tokens[1:]:
+            token_doc_ids = self.token_to_doc_ids.get(token, set())
+            candidate_doc_ids.intersection_update(token_doc_ids)
+        
+        return candidate_doc_ids
 ```
 
 ## 列族数据库原理
